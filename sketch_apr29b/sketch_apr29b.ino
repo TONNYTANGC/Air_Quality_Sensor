@@ -33,7 +33,7 @@ void loop() {
   float t = dht.readTemperature ();
   // Read analog value from MQ135 sensor and convert to CO2 level
   int analogValue = analogRead(A0); 
-  co2lvl = analogValue - 120; // Adjust for sensor offset
+  co2lvl = analogValue - 600; // Adjust for sensor offset
   co2lvl = map(co2lvl, 0, 1024, 400, 5000); // Map analog reading to CO2 range
 
   // Check for NaN (not a number) readings
