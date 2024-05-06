@@ -1,0 +1,229 @@
+#include <ESP8266WiFi.h>
+#include "Adafruit_MQTT.h"
+#include "Adafruit_MQTT_Client.h"
+
+/************************* WiFi Access Point *********************************/
+
+#define WLAN_SSID "myUUM-Guest"
+#define WLAN_PASS NULL
+
+/************************* Adafruit.io Setup *********************************/
+
+#define AIO_SERVER "io.adafruit.com"
+#define AIO_SERVERPORT 1883  // use 8883 for SSL
+#define AIO_USERNAME "your username"
+#define AIO_KEY "your API key"
+
+/************ Global State (you don't need to change this!) ******************/
+
+// Create an ESP8266 WiFiClient class to connect to the MQTT server.
+WiFiClient client;
+// or... use WiFiClientSecure for SSL
+//WiFiClientSecure client;
+
+// Setup the MQTT client class by passing in the WiFi client and MQTT server and login details.
+Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO_KEY);
+
+/****************************** Feeds ***************************************/
+
+// Setup a feed called 'photocell' for publishing.
+// Notice MQTT paths for AIO follow the form: <username>/feeds/<feedname>
+Adafruit_MQTT_Publish photocell = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/photocell");
+Adafruit_MQTT_Publish photocell1 = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/photocell1");
+Adafruit_MQTT_Publish linechart = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/linechart");
+Adafruit_MQTT_Publish stream = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/stream");
+// Setup a feed called 'onoff' for subscribing to changes.
+Adafruit_MQTT_Subscribe onoffbutton = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/onoff");
+
+/*************************** Sketch Code ************************************/
+
+// Bug workaround for Arduino 1.6.6, it seems to need a function declaration
+// for some reason (only affects ESP8266, likely an arduino-builder bug).
+#include <Wire.h>
+#include <DHT.h>
+#include <LiquidCrystal_I2C.h>
+#include "MQ135.h"
+
+// Define pin constants
+#define DHTPIN 14      // Pin for DHT11 sensor
+#define DHTTYPE DHT11  // DHT sensor type
+
+// Initialize DHT and LCD objects
+DHT dht(DHTPIN, DHTTYPE);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+int co2lvl;  // Variable to store CO2 level
+
+void MQTT_connect();
+
+void setup() {
+  Serial.begin(115200);
+  delay(10);
+
+  Serial.println(F("Adafruit MQTT demo"));
+
+  lcd.init();
+  dht.begin();
+  // Turn on LCD backlight and clear the screen
+  lcd.backlight();
+  lcd.clear();
+  delay(1000);
+  lcd.clear();  // Clear again after a delay
+
+  // Connect to WiFi access point.
+  Serial.println();
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(WLAN_SSID);
+
+  WiFi.begin(WLAN_SSID, WLAN_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // Setup MQTT subscription for onoff feed.
+  mqtt.subscribe(&onoffbutton);
+}
+
+uint32_t x = 0;
+
+void loop() {
+  lcd.clear();
+  // Ensure the connection to the MQTT server is alive (this will make the first
+  // connection and automatically reconnect when disconnected).  See the MQTT_connect
+  // function definition further below.
+  MQTT_connect();
+
+  // this is our 'wait for incoming subscription packets' busy subloop
+  // try to spend your time here
+
+  Adafruit_MQTT_Subscribe *subscription;
+  while ((subscription = mqtt.readSubscription(5000))) {
+    if (subscription == &onoffbutton) {
+      Serial.print(F("Got: "));
+      Serial.println((char *)onoffbutton.lastread);
+    }
+  }
+
+  // Read humidity and temperature from DHT sensor
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+  // Read analog value from MQ135 sensor and convert to CO2 level
+  int analogValue = analogRead(A0);
+  co2lvl = analogValue - 600;                // Adjust for sensor offset
+  co2lvl = map(co2lvl, 0, 1024, 400, 5000);  // Map analog reading to CO2 range
+
+  // Print readings to serial monitor
+  Serial.print("Humidity: ");
+  Serial.print(h);
+  Serial.print(" %\t");
+  Serial.print("Temperature: ");
+  Serial.print(t);
+  Serial.print(" *C ");
+  Serial.println("");
+  Serial.print("CO2: ");
+  Serial.print(co2lvl);
+  Serial.println(" PPM");
+
+  // Display readings on LCD
+  lcd.setCursor(0, 0);
+  lcd.print("Humi :");
+  lcd.print(h);
+  lcd.print(" %");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Temp :");
+  lcd.print(t);
+  lcd.print(" C");
+
+  delay(5000);  // Delay to read before updating LCD
+
+  lcd.clear();  // Clear screen before displaying CO2 reading
+
+  lcd.setCursor(0, 0);
+  lcd.print("CO2 :");
+  lcd.print(co2lvl);
+  lcd.print(" PPM");
+
+  char message_buff[160];
+  String airqlt;
+  // Display air quality status based on CO2 level
+  if ((co2lvl >= 350) && (co2lvl <= 1400)) {
+    lcd.setCursor(0, 1);
+    lcd.print("  Good ");
+    lcd.write(byte(0));  // Display custom character for good air quality
+    airqlt = "Good";
+  } else if ((co2lvl >= 1400) && (co2lvl <= 2000)) {
+    lcd.setCursor(0, 1);
+    lcd.print("  Bad ");  // Display custom character for bad air quality
+    lcd.write(byte(1));
+    airqlt = "Bad";
+  } else {
+    lcd.setCursor(0, 1);
+    lcd.print(" Danger!");
+    airqlt = "Danger";
+  }
+
+  delay(5000);
+  String pub = "Air Quality: " + airqlt;
+  pub.toCharArray(message_buff, pub.length() + 1);
+  Serial.print(F("\nSending photocell val "));
+  //Serial.print(x);
+  Serial.print("...");
+  if (!photocell.publish(t)) {
+    Serial.println(F("Publish Temperature Failed"));
+  } else {
+    Serial.println(F("Publish Temperature OK!"));
+  }
+  if (!photocell1.publish(h)) {
+    Serial.println(F("Publish Humidity Failed"));
+  } else {
+    Serial.println(F("Publish Humidity OK!"));
+  }
+  if (!linechart.publish(co2lvl)) {
+    Serial.println(F("Publish CO2 Level Failed"));
+  } else {
+    Serial.println(F("Publish CO2 Level OK!"));
+  }
+  if (!stream.publish(message_buff)) {
+    Serial.println(F("Publish Air Quality Failed"));
+  } else {
+    Serial.println(F("Publish Air Quality OK!"));
+  }
+}
+
+// Function to connect and reconnect as necessary to the MQTT server.
+// Should be called in the loop function and it will take care if connecting.
+void MQTT_connect() {
+  int8_t ret;
+
+  // Stop if already connected.
+  if (mqtt.connected()) {
+    return;
+  }
+
+  Serial.print("Connecting to MQTT... ");
+
+  uint8_t retries = 3;
+  while ((ret = mqtt.connect()) != 0) {  // connect will return 0 for connected
+    Serial.println(mqtt.connectErrorString(ret));
+    Serial.println("Retrying MQTT connection in 5 seconds...");
+    mqtt.disconnect();
+    delay(5000);  // wait 5 seconds
+    retries--;
+    if (retries == 0) {
+      // basically die and wait for WDT to reset me
+      while (1)
+        ;
+    }
+  }
+  Serial.println("MQTT Connected!");
+}
+
+
